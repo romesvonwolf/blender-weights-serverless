@@ -47,6 +47,7 @@ import json
 import traceback
 import time
 from mathutils import Vector
+from mathutils.kdtree import KDTree
 
 
 def log(msg):
@@ -244,6 +245,11 @@ def assign_bones_to_islands(mesh_obj, armature_obj, vert_island, num_islands):
     verts = mesh.vertices
     arm_data = armature_obj.data
 
+    kd = KDTree(len(verts))
+    for vi, v in enumerate(verts):
+        kd.insert(v.co, vi)
+    kd.balance()
+
     trunk_bones = {
         'root', 'pelvis',
         'spine_01', 'spine_02', 'spine_03', 'spine_04', 'spine_05',
@@ -259,16 +265,8 @@ def assign_bones_to_islands(mesh_obj, armature_obj, vert_island, num_islands):
             continue
 
         mid = (Vector(bone.head_local) + Vector(bone.tail_local)) * 0.5
-        best_dist = float('inf')
-        best_island = 0
-
-        for vi, v in enumerate(verts):
-            d = (v.co - mid).length_squared
-            if d < best_dist:
-                best_dist = d
-                best_island = vert_island[vi]
-
-        bone_islands[bone.name] = {best_island}
+        _co, nearest_vi, _dist = kd.find(mid)
+        bone_islands[bone.name] = {vert_island[nearest_vi]}
 
     return bone_islands
 
@@ -408,53 +406,56 @@ def clamp_weights_combined(mesh_obj, armature_obj):
     non_trunk_list = [(bname, bone_info[bname]) for bname in bone_info
                       if bname not in trunk_bones]
 
-    all_vg_map = {vg.name: vg for vg in mesh_obj.vertex_groups
-                  if vg.name in bone_info}
+    index_to_vg = {vg.index: vg for vg in mesh_obj.vertex_groups
+                   if vg.name in bone_info}
+    index_to_name = {vg.index: vg.name for vg in mesh_obj.vertex_groups
+                     if vg.name in bone_info}
+    removals = {}  # group index -> [vertex indices] (batched remove is much faster)
 
     for vi in range(V):
-        vert_pos = verts[vi].co
+        vert = verts[vi]
+        vert_pos = vert.co
 
-        # Compute distance to every non-trunk bone
-        bone_dists = []
-        for bname, bi in non_trunk_list:
-            d = point_to_segment_dist(vert_pos, bi['head'], bi['tail'])
-            bone_dists.append((d, bname))
+        # Only consider non-trunk bones that actually have weight here.
+        weighted_non_trunk = []
+        for g in vert.groups:
+            bname = index_to_name.get(g.group)
+            if not bname or bname in trunk_bones or g.weight < 0.0001:
+                continue
+            weighted_non_trunk.append((bname, g.group, g.weight))
 
-        # Sort by distance — the K nearest are "allowed"
+        if not weighted_non_trunk:
+            continue
+
+        bone_dists = [
+            (point_to_segment_dist(vert_pos, bi['head'], bi['tail']), bname)
+            for bname, bi in non_trunk_list
+        ]
         bone_dists.sort()
-        allowed_bones = set(b[1] for b in bone_dists[:MAX_BONE_INFLUENCES])
+        allowed_bones = {b for _, b in bone_dists[:MAX_BONE_INFLUENCES]}
 
-        # Strip weights from non-trunk bones NOT in the allowed set
-        for bname, bi in non_trunk_list:
+        for bname, grp_idx, w in weighted_non_trunk:
             if bname in allowed_bones:
                 continue
-            vg = all_vg_map.get(bname)
-            if not vg:
-                continue
-            try:
-                w = vg.weight(vi)
-            except RuntimeError:
-                continue
-            if w < 0.0001:
-                continue
-
-            vg.remove([vi])
+            removals.setdefault(grp_idx, []).append(vi)
             phase2_clamped += 1
             phase2_per_bone[bname] = phase2_per_bone.get(bname, 0) + 1
 
             if len(phase2_debug_samples) < 20:
-                nearest_name = bone_dists[0][1]
                 phase2_debug_samples.append({
                     'vi': vi,
                     'stripped_bone': bname,
                     'stripped_dist': round(point_to_segment_dist(
                         vert_pos, bone_info[bname]['head'], bone_info[bname]['tail']), 2),
-                    'nearest_bone': nearest_name,
+                    'nearest_bone': bone_dists[0][1],
                     'nearest_dist': round(bone_dists[0][0], 2),
-                    'allowed': [b[1] for b in bone_dists[:MAX_BONE_INFLUENCES]],
+                    'allowed': [b for _, b in bone_dists[:MAX_BONE_INFLUENCES]],
                     'weight': round(w, 4),
                     'vert': [round(c, 4) for c in vert_pos],
                 })
+
+    for grp_idx, vis in removals.items():
+        index_to_vg[grp_idx].remove(vis)
 
     debug['phase2_clamped'] = phase2_clamped
     debug['phase2_per_bone'] = phase2_per_bone
@@ -513,27 +514,30 @@ def smooth_vertex_groups(mesh_obj, passes=2, factor=0.3):
 
 
 def extract_weights(mesh_obj, V):
+    """Read vertex-group weights via mesh.vertices[].groups (O(V·k)), not
+    vertex_group.weight(vi) per bone (O(V·B)) — the latter is catastrophically
+    slow on 500k+ vert meshes (minutes of Python↔Blender API calls)."""
+    mesh = mesh_obj.data
+    index_to_name = {vg.index: vg.name for vg in mesh_obj.vertex_groups}
+    log(f"Vertex groups created: {len(index_to_name)}")
+
     weights = {}
     zero_weight_count = 0
-    vg_names = {vg.index: vg.name for vg in mesh_obj.vertex_groups}
-    log(f"Vertex groups created: {len(vg_names)}")
-
-    for vg_idx, vg_name in vg_names.items():
-        bone_weights = {}
-        for vi in range(V):
-            try:
-                w = mesh_obj.vertex_groups[vg_idx].weight(vi)
-                if w > 0.0001:
-                    bone_weights[str(vi)] = round(w, 6)
-            except RuntimeError:
-                pass
-        if bone_weights:
-            weights[vg_name] = bone_weights
-
     for vi in range(V):
+        vert = mesh.vertices[vi]
         total = 0.0
-        for vg_name, bw in weights.items():
-            total += bw.get(str(vi), 0.0)
+        for g in vert.groups:
+            if g.weight <= 0.0001:
+                continue
+            name = index_to_name.get(g.group)
+            if not name:
+                continue
+            total += g.weight
+            bucket = weights.get(name)
+            if bucket is None:
+                bucket = {}
+                weights[name] = bucket
+            bucket[str(vi)] = round(g.weight, 6)
         if total < 0.0001:
             zero_weight_count += 1
 
@@ -581,22 +585,35 @@ def compute_weights(data):
 
     repaired_V = repair_mesh(mesh_obj)
     armature_obj = build_armature(bones)
+
+    t_heat = time.time()
     weight_method = try_auto_weight(mesh_obj, armature_obj)
+    heat_elapsed = round(time.time() - t_heat, 2)
+    log(f"Bone heat solve: {heat_elapsed}s ({weight_method})")
 
     # Smooth FIRST, then clamp. Smoothing can re-introduce bleed across gaps,
     # so clamping must be the final distance-enforcement step.
+    t_smooth = time.time()
     smooth_vertex_groups(mesh_obj, passes=1, factor=0.15)
 
     if weight_method == 'ARMATURE_ENVELOPE':
         smooth_vertex_groups(mesh_obj, passes=2, factor=0.3)
+    smooth_elapsed = round(time.time() - t_smooth, 2)
+    log(f"Smoothing: {smooth_elapsed}s")
 
     # Two-phase weight clamping (AFTER smoothing):
     # Phase 1 — Island: strip cross-island bleed (edge connectivity)
     # Phase 2 — Cross-limb distance: strip same-mesh bleed where a bone
     #           on limb A influences vertices much closer to limb B
+    t_clamp = time.time()
     clamped_count, island_debug = clamp_weights_combined(mesh_obj, armature_obj)
+    clamp_elapsed = round(time.time() - t_clamp, 2)
+    log(f"Weight clamping: {clamp_elapsed}s")
 
+    t_extract = time.time()
     weights, zero_weight_count = extract_weights(mesh_obj, repaired_V)
+    extract_elapsed = round(time.time() - t_extract, 2)
+    log(f"Weight extraction: {extract_elapsed}s")
 
     # Build per-bone weight stats for debugging
     bone_weight_stats = {}
@@ -635,6 +652,13 @@ def compute_weights(data):
             'islands': island_debug,
             'bone_weight_stats': bone_weight_stats,
             'debug_vert_positions': debug_vert_positions,
+            'timing': {
+                'bone_heat_s': heat_elapsed,
+                'smooth_s': smooth_elapsed,
+                'clamp_s': clamp_elapsed,
+                'extract_s': extract_elapsed,
+                'total_s': round(elapsed, 2),
+            },
         },
         'elapsed': round(elapsed, 2),
     }
