@@ -7,8 +7,9 @@ droplet OOMs on those).
 
 Large payloads do NOT travel through the RunPod job body (which is capped at a
 few MB in/out). Instead:
-  - INPUT  : the client uploads the gzipped mesh JSON to Backblaze B2 and passes
-             us a public `input_url`. We download + gunzip it.
+  - INPUT  : the client uploads the gzipped mesh to Backblaze B2 and passes us a
+             public `input_url`. We download + gunzip it. The payload is either a
+             compact 'SMW1' binary blob (preferred — see _decode_smw1) or JSON.
   - OUTPUT : we gzip the weights JSON and PUT it to a presigned `output_put_url`
              (also on B2). We return only a small summary; the client downloads
              the weights from B2 directly.
@@ -37,14 +38,17 @@ bone_count, diagnostics, elapsed, ... }. Without it: the full weights inline
 """
 
 import os
+import sys
 import json
 import time
 import gzip
 import base64
+import struct
 import subprocess
 import tempfile
 import traceback
 import urllib.request
+from array import array
 
 import runpod
 
@@ -68,6 +72,51 @@ def _maybe_gunzip(raw):
     return raw
 
 
+def _decode_smw1(buf):
+    """Decode the compact 'SMW1' binary mesh blob the browser uploads.
+
+    Layout (little-endian):
+      magic 'SMW1' | uint32 Vn | uint32 Tn | uint32 Bn |
+      float32[Vn*3] verts | uint32[Tn*3] tris | Bn bytes UTF-8 bones JSON
+    Returns the same {vertices, triangles, bones} dict as the JSON path.
+    """
+    if len(buf) < 16 or buf[0:4] != b"SMW1":
+        raise ValueError("not an SMW1 blob")
+    Vn, Tn, Bn = struct.unpack_from("<III", buf, 4)
+    off = 16
+
+    vbytes = Vn * 3 * 4
+    verts_arr = array("f")
+    verts_arr.frombytes(bytes(buf[off:off + vbytes]))
+    off += vbytes
+    if sys.byteorder != "little":
+        verts_arr.byteswap()
+
+    tbytes = Tn * 3 * 4
+    tris_arr = array("i")  # C int = 4 bytes on x86_64; indices are < 2^31
+    if tris_arr.itemsize != 4:
+        raise ValueError(f"unexpected int itemsize {tris_arr.itemsize}")
+    tris_arr.frombytes(bytes(buf[off:off + tbytes]))
+    off += tbytes
+    if sys.byteorder != "little":
+        tris_arr.byteswap()
+
+    bones = json.loads(bytes(buf[off:off + Bn]).decode("utf-8"))
+
+    vertices = [[verts_arr[i], verts_arr[i + 1], verts_arr[i + 2]]
+                for i in range(0, len(verts_arr), 3)]
+    triangles = [[tris_arr[i], tris_arr[i + 1], tris_arr[i + 2]]
+                 for i in range(0, len(tris_arr), 3)]
+    return {"vertices": vertices, "triangles": triangles, "bones": bones}
+
+
+def _parse_mesh_bytes(raw):
+    """raw is already gunzipped — decode SMW1 binary or JSON."""
+    if len(raw) >= 4 and raw[0:4] == b"SMW1":
+        return _decode_smw1(raw)
+    return json.loads(raw)
+
+
 def _put(url, data, content_type, timeout=300):
     req = urllib.request.Request(url, data=data, method="PUT")
     req.add_header("Content-Type", content_type)
@@ -78,10 +127,9 @@ def _put(url, data, content_type, timeout=300):
 
 def _load_input(ji):
     if ji.get("input_url"):
-        raw = _maybe_gunzip(_download(ji["input_url"]))
-        return json.loads(raw)
+        return _parse_mesh_bytes(_maybe_gunzip(_download(ji["input_url"])))
     if ji.get("mesh_gzip_b64"):
-        return json.loads(gzip.decompress(base64.b64decode(ji["mesh_gzip_b64"])))
+        return _parse_mesh_bytes(gzip.decompress(base64.b64decode(ji["mesh_gzip_b64"])))
     return {
         "vertices": ji["vertices"],
         "triangles": ji["triangles"],
