@@ -881,6 +881,15 @@ def compute_weights_harmonic(data):
         rowsum[zidx] = 1.0
     W /= rowsum[:, None]
 
+    # Remap repaired-mesh weights to INPUT vertex order (see voxel path): the
+    # client maps weights by the index it sent, but repair_mesh can reorder /
+    # merge vertices. Resample at each input vertex via nearest repaired vertex.
+    from scipy.spatial import cKDTree as _cKDTree
+    V_input = np.asarray(data['vertices'], dtype=np.float64)
+    nn = _cKDTree(co).query(V_input, k=1)[1]
+    W = W[nn]
+    log(f"Harmonic: remapped repaired->input order ({co.shape[0]} -> {V_input.shape[0]} verts)")
+
     # --- 5. build sparse weights dict {bone: {vi: w}} ---
     t_e = time.time()
     weights = {}
@@ -1352,7 +1361,21 @@ def compute_weights_voxel(data):
         rowsum[zidx] = 1.0
     W /= rowsum[:, None]
 
-    # --- 7. extract sparse weights dict --------------------------------------
+    # --- 6.5 remap repaired-mesh weights to the INPUT vertex order -----------
+    # CRITICAL: Blender's repair_mesh (remove_doubles / delete_loose) can
+    # reorder and merge vertices, so W is indexed by the REPAIRED mesh, not the
+    # array the client sent. The client maps weights back by INPUT index
+    # (weights[si][vi]), so returning repaired-order indices silently scrambles
+    # every weight (the long-standing "speckle"/cross-gap bleed). Resample W at
+    # each input vertex via its nearest repaired vertex so the indices the
+    # client expects are correct.
+    from scipy.spatial import cKDTree as _cKDTree
+    V_input = np.asarray(data['vertices'], dtype=np.float64)
+    nn = _cKDTree(co).query(V_input, k=1)[1]
+    W = W[nn]
+    log(f"Voxel: remapped repaired->input order ({co.shape[0]} repaired -> {V_input.shape[0]} input verts)")
+
+    # --- 7. extract sparse weights dict (INPUT vertex order) -----------------
     t_e = time.time()
     weights = {}
     nz_v, nz_b = np.where(W > _VOX_WMIN)
@@ -1376,10 +1399,20 @@ def compute_weights_voxel(data):
         }
     log(f"Voxel done: {len(weights)} bones, {zero_weight_count} zero verts, {elapsed:.1f}s")
 
+    # Lab debug: return the repaired-mesh vertex positions so an external
+    # harness can remap server weight indices to its own mesh by position
+    # (Blender's repair_mesh can reorder vertices vs the input array).
+    debug_positions_b64 = None
+    if data.get('debug_positions'):
+        import base64
+        debug_positions_b64 = base64.b64encode(
+            co.astype('float32').tobytes()).decode('ascii')
+
     return {
         'weights': weights,
         'bone_count': len(weights),
         'weight_method': 'VOXEL_VOLUMETRIC',
+        'debug_positions_b64': debug_positions_b64,
         'diagnostics': {
             'input_verts': V_in,
             'input_tris': T_in,
