@@ -893,9 +893,17 @@ def compute_weights(data):
         try:
             return compute_weights_harmonic(data)
         except Exception as e:
-            log(f"Harmonic solver failed ({e}); falling back to bone-heat")
+            tb = traceback.format_exc()
+            log(f"Harmonic solver failed ({type(e).__name__}: {e}); falling back to bone-heat")
             traceback.print_exc()
-            return compute_weights_bone_heat(data)
+            result = compute_weights_bone_heat(data)
+            # Surface WHY harmonic fell back so it's visible in the returned
+            # JSON (the handler discards Blender stdout on success).
+            if isinstance(result, dict):
+                diag = result.setdefault('diagnostics', {})
+                diag['harmonic_fallback_error'] = f"{type(e).__name__}: {e}"
+                diag['harmonic_fallback_traceback'] = tb[-2000:]
+            return result
     return compute_weights_bone_heat(data)
 
 
