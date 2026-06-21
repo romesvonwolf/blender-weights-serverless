@@ -938,9 +938,486 @@ def compute_weights_harmonic(data):
     }
 
 
+# ===========================================================================
+# Volumetric voxel binder (the robust core)
+# ===========================================================================
+# Surface methods (bone-heat, harmonic) leak across gaps because the body is a
+# single connected manifold -- arm influence always finds a SURFACE path to the
+# side torso/hair. The volumetric approach fills the mesh INTERIOR with voxels
+# and diffuses each bone's influence THROUGH the solid, so empty space (the
+# armpit, the gap between hair and arm) simply has no voxels and cannot carry
+# weight. Mirrors Maya's Geodesic Voxel Binding (Dionne & de Lasa, SIGGRAPH
+# 2013) and Blender's Voxel Heat Diffuse addon. scipy/numpy are imported lazily
+# so the module still loads (and falls back) on an image without scipy.
+
+_VOX_TARGET_AXIS = 200        # cells along the longest bbox axis (quality)
+_VOX_MAX_OCCUPIED = 700_000   # cap occupied voxels (auto-downscale if exceeded)
+_VOX_MIN_AXIS = 40
+_VOX_MAX_INFLUENCES = 4
+_VOX_WMIN = 1e-4
+_VOX_CG_MAXITER = 800
+# Substrings (case-insensitive) of bones that need SURFACE precision (the voxel
+# solid fuses adjacent fingers/lips). Body/clothing keeps the volumetric result.
+_VOX_FINE_BONE_PATTERNS = (
+    'hand', 'finger', 'thumb', 'index', 'middle', 'ring', 'pinky', 'pinkie',
+    'toe', 'eye', 'jaw', 'tongue', 'teeth', 'lip',
+)
+
+
+def _ray_hits(bvh, o, d, length, eps):
+    """All surface crossing distances (from o, along unit d) up to `length`."""
+    hits = []
+    base = 0.0
+    cur = o.copy()
+    while base < length:
+        r = bvh.ray_cast(cur, d, length - base)
+        if r[0] is None:
+            break
+        hit_at = base + r[3]
+        hits.append(hit_at)
+        base = hit_at + eps
+        cur = o + d * base
+    return hits
+
+
+def _voxelize_solid(co, tri, res):
+    """Solidify the mesh into an occupancy grid via multi-axis ray parity.
+
+    A voxel is SOLID if it is inside the surface along >=2 of the three axis
+    sweeps (majority vote -> robust to a hole on any single axis) OR it directly
+    contains the surface (boundary). Returns (solid bool[nx,ny,nz], origin xyz,
+    cell size). Handles non-watertight / multi-component / self-intersecting
+    meshes -- exactly the messy output of image-to-3D models.
+    """
+    import numpy as np
+    from mathutils import Vector as _V
+    from mathutils.bvhtree import BVHTree
+
+    verts = [_V((float(p[0]), float(p[1]), float(p[2]))) for p in co]
+    polys = [(int(t[0]), int(t[1]), int(t[2])) for t in tri]
+    bvh = BVHTree.FromPolygons(verts, polys, all_triangles=True, epsilon=0.0)
+
+    mn = co.min(axis=0)
+    mx = co.max(axis=0)
+    ext = mx - mn
+    longest = float(ext.max()) or 1.0
+    cell = longest / float(res)
+    pad = cell * 2.0
+    origin = mn - pad
+    dims = np.floor((mx + pad - origin) / cell).astype(int) + 2
+    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+    eps = cell * 1e-4
+
+    inside_count = np.zeros((nx, ny, nz), dtype=np.uint8)
+    boundary = np.zeros((nx, ny, nz), dtype=bool)
+
+    axes = [
+        # (axis, n_axis, dir vector, the two perpendicular extents/counts)
+        (2, nz, _V((0.0, 0.0, 1.0)), nx, ny),
+        (1, ny, _V((0.0, 1.0, 0.0)), nx, nz),
+        (0, nx, _V((1.0, 0.0, 0.0)), ny, nz),
+    ]
+    for axis, n_axis, dvec, na, nb in axes:
+        centers = (np.arange(n_axis) + 0.5) * cell  # distance from grid corner
+        length = n_axis * cell
+        for ia in range(na):
+            for ib in range(nb):
+                if axis == 2:
+                    ox = origin[0] + (ia + 0.5) * cell
+                    oy = origin[1] + (ib + 0.5) * cell
+                    o = _V((ox, oy, float(origin[2])))
+                elif axis == 1:
+                    ox = origin[0] + (ia + 0.5) * cell
+                    oz = origin[2] + (ib + 0.5) * cell
+                    o = _V((ox, float(origin[1]), oz))
+                else:
+                    oy = origin[1] + (ia + 0.5) * cell
+                    oz = origin[2] + (ib + 0.5) * cell
+                    o = _V((float(origin[0]), oy, oz))
+                hits = _ray_hits(bvh, o, dvec, length, eps)
+                if not hits:
+                    continue
+                ha = np.asarray(hits)
+                kb = (ha / cell).astype(int)
+                kb = kb[(kb >= 0) & (kb < n_axis)]
+                inside = (np.searchsorted(ha, centers, side='right') & 1).astype(bool)
+                if axis == 2:
+                    boundary[ia, ib, kb] = True
+                    inside_count[ia, ib, inside] += 1
+                elif axis == 1:
+                    boundary[ia, kb, ib] = True
+                    inside_count[ia, inside, ib] += 1
+                else:
+                    boundary[kb, ia, ib] = True
+                    inside_count[inside, ia, ib] += 1
+
+    solid = (inside_count >= 2) | boundary
+    return solid, np.asarray(origin, dtype=np.float64), float(cell)
+
+
+def _build_voxel_laplacian(solid):
+    """Graph Laplacian over occupied voxels (6-connectivity). Edges exist only
+    between SOLID neighbours, so weight cannot diffuse across empty space."""
+    import numpy as np
+    import scipy.sparse as sp
+    nx, ny, nz = solid.shape
+    vid = -np.ones(solid.shape, dtype=np.int64)
+    occ = np.argwhere(solid)
+    M = occ.shape[0]
+    if M == 0:
+        return vid, 0, None, occ
+    vid[occ[:, 0], occ[:, 1], occ[:, 2]] = np.arange(M)
+    rs, cs = [], []
+    for dx, dy, dz in ((1, 0, 0), (0, 1, 0), (0, 0, 1)):
+        a = vid[0:nx - dx, 0:ny - dy, 0:nz - dz]
+        b = vid[dx:nx, dy:ny, dz:nz]
+        m = (a >= 0) & (b >= 0)
+        rs.append(a[m]); cs.append(b[m])
+    r = np.concatenate(rs); c = np.concatenate(cs)
+    rr = np.concatenate([r, c]); cc = np.concatenate([c, r])
+    A = sp.coo_matrix((np.ones(rr.shape[0]), (rr, cc)), shape=(M, M)).tocsr()
+    deg = np.asarray(A.sum(axis=1)).ravel()
+    L = (sp.diags(deg) - A).tocsr()
+    return vid, M, L, occ
+
+
+def _voxel_bone_sources(heads, tails, origin, cell, vid, solid, centers):
+    """Bone segments -> source voxels. Returns (src_ids array, bc S×B matrix
+    row-normalized to a partition of unity). A bone whose segment lies outside
+    the solid snaps to the nearest occupied voxel."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    nx, ny, nz = solid.shape
+    B = heads.shape[0]
+    claims = {}  # voxel_id -> np.zeros(B) bone membership counts
+
+    def add(vidx, b):
+        e = claims.get(vidx)
+        if e is None:
+            e = np.zeros(B)
+            claims[vidx] = e
+        e[b] += 1.0
+
+    tree = None
+    for b in range(B):
+        a = heads[b]
+        seg = tails[b] - a
+        seglen = float(np.linalg.norm(seg))
+        n = max(2, int(seglen / (cell * 0.5)) + 1)
+        ts = np.linspace(0.0, 1.0, n)
+        pts = a[None, :] + ts[:, None] * seg[None, :]
+        gi = np.floor((pts - origin[None, :]) / cell).astype(int)
+        claimed = False
+        for k in range(n):
+            i, j, kk = int(gi[k, 0]), int(gi[k, 1]), int(gi[k, 2])
+            if 0 <= i < nx and 0 <= j < ny and 0 <= kk < nz and vid[i, j, kk] >= 0:
+                add(int(vid[i, j, kk]), b)
+                claimed = True
+        if not claimed:
+            if tree is None:
+                tree = cKDTree(centers)
+            mid = a + 0.5 * seg
+            _, vidx = tree.query(mid)
+            add(int(vidx), b)
+
+    src_ids = np.array(sorted(claims.keys()), dtype=np.int64)
+    bc = np.zeros((len(src_ids), B), dtype=np.float64)
+    for r, vidx in enumerate(src_ids):
+        bc[r] = claims[vidx]
+    rowsum = bc.sum(axis=1, keepdims=True)
+    rowsum[rowsum == 0] = 1.0
+    bc /= rowsum
+    return src_ids, bc
+
+
+def _solve_voxel_harmonic(L, M, src_ids, bc, B):
+    """Dirichlet harmonic interpolation through the volume: solve L w = 0 with
+    w fixed to bc at source voxels. Parameter-free, partition of unity, smooth,
+    and gap-aware (L has no edges across empty space). Returns W (M×B)."""
+    import numpy as np
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    is_src = np.zeros(M, dtype=bool)
+    is_src[src_ids] = True
+    free = np.where(~is_src)[0]
+    W = np.zeros((M, B), dtype=np.float64)
+    W[src_ids] = bc
+    if free.size == 0:
+        return W
+    L_ff = L[free][:, free].tocsc()
+    L_fs = L[free][:, src_ids].tocsc()
+    L_ff = L_ff + 1e-8 * sp.identity(free.size, format='csc')
+    solve = None
+    try:
+        solve = spla.factorized(L_ff)
+        log('Voxel: SuperLU factorization of L_ff')
+    except Exception as e:
+        log(f'Voxel: splu failed ({e}); using CG')
+    Mdiag = None
+    if solve is None:
+        dinv = 1.0 / L_ff.diagonal()
+        Mdiag = spla.LinearOperator((free.size, free.size), matvec=lambda x: x * dinv)
+    for b in range(B):
+        rhs = -(L_fs @ bc[:, b])
+        if not np.any(rhs):
+            continue
+        if solve is not None:
+            W[free, b] = solve(rhs)
+        else:
+            x, _info = spla.cg(L_ff, rhs, M=Mdiag, maxiter=_VOX_CG_MAXITER)
+            W[free, b] = x
+    np.clip(W, 0.0, 1.0, out=W)
+    return W
+
+
+def _transfer_voxels_to_verts(co, origin, cell, vid, W_vox, centers):
+    """Trilinear interpolation of per-bone voxel weights onto surface verts."""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    nx, ny, nz = vid.shape
+    V = co.shape[0]
+    B = W_vox.shape[1]
+    gf = (co - origin[None, :]) / cell - 0.5
+    i0 = np.floor(gf).astype(int)
+    f = gf - i0
+    accW = np.zeros((V, B), dtype=np.float64)
+    accC = np.zeros(V, dtype=np.float64)
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                ii = i0[:, 0] + dx
+                jj = i0[:, 1] + dy
+                kk = i0[:, 2] + dz
+                inb = (ii >= 0) & (ii < nx) & (jj >= 0) & (jj < ny) & (kk >= 0) & (kk < nz)
+                cx = f[:, 0] if dx else (1.0 - f[:, 0])
+                cy = f[:, 1] if dy else (1.0 - f[:, 1])
+                cz = f[:, 2] if dz else (1.0 - f[:, 2])
+                coeff = cx * cy * cz
+                iic = np.clip(ii, 0, nx - 1)
+                jjc = np.clip(jj, 0, ny - 1)
+                kkc = np.clip(kk, 0, nz - 1)
+                vids = vid[iic, jjc, kkc]
+                valid = inb & (vids >= 0) & (coeff > 0)
+                if not np.any(valid):
+                    continue
+                vv = vids[valid]
+                cc = coeff[valid]
+                accW[valid] += W_vox[vv] * cc[:, None]
+                accC[valid] += cc
+    # verts with no solid coverage -> nearest occupied voxel
+    miss = np.where(accC <= 1e-9)[0]
+    if miss.size:
+        tree = cKDTree(centers)
+        _, nv = tree.query(co[miss])
+        accW[miss] = W_vox[nv]
+        accC[miss] = 1.0
+    accW /= accC[:, None]
+    return accW
+
+
+def _surface_harmonic_W(co, tri, heads, tails):
+    """Lean surface harmonic (nearest-bone seed, no visibility) used ONLY for
+    fine regions. Surface connectivity keeps fingers/lips separate (the one
+    thing the volumetric solid fuses)."""
+    import numpy as np
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    V = co.shape[0]
+    B = heads.shape[0]
+    D = _all_bone_distances(co, heads, tails)
+    nearest = np.argmin(D, axis=1)
+    P = sp.coo_matrix((np.ones(V), (np.arange(V), nearest)), shape=(V, B)).tocsc()
+    L = _cotangent_laplacian(co, tri)
+    Ldiag = L.diagonal()
+    h = float(np.median(Ldiag[Ldiag > 0]))
+    if not np.isfinite(h) or h <= 0:
+        h = 1.0
+    A = (L + h * sp.identity(V, format='csr')).tocsc()
+    try:
+        solve = spla.factorized(A)
+    except Exception:
+        solve = None
+    W = np.zeros((V, B), dtype=np.float64)
+    for b in range(B):
+        rhs = h * np.asarray(P[:, b].todense()).ravel()
+        if rhs.max() <= 0:
+            continue
+        if solve is not None:
+            W[:, b] = solve(rhs)
+        else:
+            x, _i = spla.cg(A, rhs, maxiter=400)
+            W[:, b] = x
+    np.clip(W, 0.0, None, out=W)
+    rs = W.sum(axis=1)
+    rs[rs < 1e-8] = 1.0
+    W /= rs[:, None]
+    return W
+
+
+def compute_weights_voxel(data):
+    t0 = time.time()
+    import numpy as np
+
+    mesh_obj, V_in, T_in, dupe_faces, repaired_V = _prepare_scene(data)
+    bones = data['bones']
+    B = len(bones)
+    names, heads, tails = _bone_arrays(bones)
+    co, nrm, tri = _read_mesh_numpy(mesh_obj)
+    V = co.shape[0]
+    log(f"Voxel: {V} verts, {tri.shape[0]} tris, {B} bones")
+
+    # --- 1. voxelize to a solid grid (auto-resolution under the occupied cap) -
+    t_v = time.time()
+    res = _VOX_TARGET_AXIS
+    solid, origin, cell = _voxelize_solid(co, tri, res)
+    M0 = int(solid.sum())
+    if M0 > _VOX_MAX_OCCUPIED:
+        res2 = max(_VOX_MIN_AXIS, int(res * (_VOX_MAX_OCCUPIED / max(M0, 1)) ** (1.0 / 3.0)))
+        log(f"Voxel: {M0} occupied > cap {_VOX_MAX_OCCUPIED}; res {res}->{res2}")
+        solid, origin, cell = _voxelize_solid(co, tri, res2)
+        res = res2
+        M0 = int(solid.sum())
+    frac = M0 / float(solid.size)
+    log(f"Voxel: res={res} cell={cell:.4f} solid={M0} ({frac*100:.1f}% of grid) in {round(time.time()-t_v,2)}s")
+    if M0 < 8:
+        raise RuntimeError(f"voxelization degenerate ({M0} solid voxels)")
+    if frac > 0.985:
+        raise RuntimeError(f"voxelization filled {frac*100:.1f}% of grid (bad normals / inverted mesh)")
+
+    # --- 2. voxel graph + bone source voxels ---------------------------------
+    t_g = time.time()
+    vid, M, L, occ = _build_voxel_laplacian(solid)
+    centers = origin[None, :] + (occ + 0.5) * cell
+    src_ids, bc = _voxel_bone_sources(heads, tails, origin, cell, vid, solid, centers)
+    log(f"Voxel: graph {M} nodes, {src_ids.shape[0]} source voxels in {round(time.time()-t_g,2)}s")
+
+    # --- 3. Dirichlet harmonic through the volume ----------------------------
+    t_s = time.time()
+    W_vox = _solve_voxel_harmonic(L, M, src_ids, bc, B)
+    log(f"Voxel: volume solve {round(time.time()-t_s,2)}s")
+
+    # --- 4. transfer to surface vertices -------------------------------------
+    t_t = time.time()
+    W = _transfer_voxels_to_verts(co, origin, cell, vid, W_vox, centers)
+    log(f"Voxel: transfer {round(time.time()-t_t,2)}s")
+
+    # --- 5. fine-region surface pass (fingers / face) ------------------------
+    fine_bones = np.array([
+        any(p in nm.lower() for p in _VOX_FINE_BONE_PATTERNS) for nm in names
+    ], dtype=bool)
+    fine_verts_count = 0
+    if fine_bones.any():
+        t_f = time.time()
+        W_surf = _surface_harmonic_W(co, tri, heads, tails)
+        dom_vox = np.argmax(W, axis=1)
+        dom_surf = np.argmax(W_surf, axis=1)
+        fine_vert = fine_bones[dom_vox] | fine_bones[dom_surf]
+        fine_verts_count = int(fine_vert.sum())
+        W[fine_vert] = W_surf[fine_vert]
+        log(f"Voxel: fine surface pass on {fine_verts_count} verts "
+            f"({int(fine_bones.sum())} fine bones) in {round(time.time()-t_f,2)}s")
+
+    # --- 6. max-4 influences, normalize, rescue ------------------------------
+    if B > _VOX_MAX_INFLUENCES:
+        keep = np.argpartition(W, B - _VOX_MAX_INFLUENCES, axis=1)[:, -_VOX_MAX_INFLUENCES:]
+        mask = np.zeros_like(W, dtype=bool)
+        np.put_along_axis(mask, keep, True, axis=1)
+        W[~mask] = 0.0
+    rowsum = W.sum(axis=1)
+    zero_weight_count = int((rowsum < 1e-8).sum())
+    if zero_weight_count:
+        # rescue all-zero verts to nearest bone by segment distance
+        D = _all_bone_distances(co, heads, tails)
+        zidx = np.where(rowsum < 1e-8)[0]
+        W[zidx, np.argmin(D[zidx], axis=1)] = 1.0
+        rowsum[zidx] = 1.0
+    W /= rowsum[:, None]
+
+    # --- 7. extract sparse weights dict --------------------------------------
+    t_e = time.time()
+    weights = {}
+    nz_v, nz_b = np.where(W > _VOX_WMIN)
+    for vi, b in zip(nz_v.tolist(), nz_b.tolist()):
+        bucket = weights.get(names[b])
+        if bucket is None:
+            bucket = {}
+            weights[names[b]] = bucket
+        bucket[str(vi)] = round(float(W[vi, b]), 6)
+    log(f"Voxel: extract {round(time.time()-t_e,2)}s, {len(weights)} bones")
+
+    elapsed = time.time() - t0
+    bone_weight_stats = {}
+    for bname, bw in weights.items():
+        ws = list(bw.values())
+        bone_weight_stats[bname] = {
+            'verts': len(ws),
+            'min_w': round(min(ws), 4) if ws else 0,
+            'max_w': round(max(ws), 4) if ws else 0,
+            'avg_w': round(sum(ws) / len(ws), 4) if ws else 0,
+        }
+    log(f"Voxel done: {len(weights)} bones, {zero_weight_count} zero verts, {elapsed:.1f}s")
+
+    return {
+        'weights': weights,
+        'bone_count': len(weights),
+        'weight_method': 'VOXEL_VOLUMETRIC',
+        'diagnostics': {
+            'input_verts': V_in,
+            'input_tris': T_in,
+            'repaired_verts': repaired_V,
+            'duplicate_faces': dupe_faces,
+            'zero_weight_verts': zero_weight_count,
+            'bones_with_weights': len(weights),
+            'bones_requested': B,
+            'solver': {
+                'method': 'voxel_volumetric',
+                'voxel_res': res,
+                'voxel_cell': round(cell, 5),
+                'solid_voxels': M0,
+                'grid_fill_frac': round(frac, 4),
+                'source_voxels': int(src_ids.shape[0]),
+                'fine_bones': int(fine_bones.sum()),
+                'fine_verts': fine_verts_count,
+            },
+            'bone_weight_stats': bone_weight_stats,
+            'timing': {'total_s': round(elapsed, 2)},
+        },
+        'elapsed': round(elapsed, 2),
+    }
+
+
 def compute_weights(data):
-    """Dispatch: harmonic (principled) by default, bone-heat as fallback."""
-    method = (data.get('method') or 'harmonic').lower()
+    """Dispatch: voxel (volumetric, robust) by default; harmonic then bone-heat
+    as fallbacks. Each stage records why it fell back in the returned JSON."""
+    method = (data.get('method') or 'voxel').lower()
+
+    def _harmonic_then_boneheat(prev_err=None, prev_tb=None):
+        try:
+            res = compute_weights_harmonic(data)
+        except Exception as e2:
+            tb2 = traceback.format_exc()
+            log(f"Harmonic failed ({type(e2).__name__}: {e2}); bone-heat")
+            traceback.print_exc()
+            res = compute_weights_bone_heat(data)
+            if isinstance(res, dict):
+                d = res.setdefault('diagnostics', {})
+                d['harmonic_fallback_error'] = f"{type(e2).__name__}: {e2}"
+                d['harmonic_fallback_traceback'] = tb2[-2000:]
+        if prev_err and isinstance(res, dict):
+            d = res.setdefault('diagnostics', {})
+            d['voxel_fallback_error'] = prev_err
+            d['voxel_fallback_traceback'] = (prev_tb or '')[-2000:]
+        return res
+
+    if method in ('voxel', 'volumetric', 'voxel_volumetric'):
+        try:
+            return compute_weights_voxel(data)
+        except Exception as e:
+            tb = traceback.format_exc()
+            log(f"Voxel solver failed ({type(e).__name__}: {e}); falling back")
+            traceback.print_exc()
+            return _harmonic_then_boneheat(f"{type(e).__name__}: {e}", tb)
+
     if method in ('harmonic', 'visibility', 'harmonic_visibility'):
         try:
             return compute_weights_harmonic(data)
@@ -949,13 +1426,12 @@ def compute_weights(data):
             log(f"Harmonic solver failed ({type(e).__name__}: {e}); falling back to bone-heat")
             traceback.print_exc()
             result = compute_weights_bone_heat(data)
-            # Surface WHY harmonic fell back so it's visible in the returned
-            # JSON (the handler discards Blender stdout on success).
             if isinstance(result, dict):
                 diag = result.setdefault('diagnostics', {})
                 diag['harmonic_fallback_error'] = f"{type(e).__name__}: {e}"
                 diag['harmonic_fallback_traceback'] = tb[-2000:]
             return result
+
     return compute_weights_bone_heat(data)
 
 
