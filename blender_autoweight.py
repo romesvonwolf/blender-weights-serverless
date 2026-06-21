@@ -613,6 +613,13 @@ _HARM_PIN_FACTOR = 1.0       # pin stiffness vs Laplacian scale (higher = sharpe
 _HARM_MAX_INFLUENCES = 4
 _HARM_WMIN = 1e-4
 _HARM_CG_MAXITER = 400
+# Visibility is tested against points sampled along the bone SHAFT (not the
+# closest point, which can be an endpoint buried in shared joint flesh -- e.g.
+# the upper-arm head inside the shoulder, reachable from the side torso THROUGH
+# solid without crossing the armpit gap). Targeting the shaft forces the ray to
+# cross any real air gap. A bone is "visible" iff at least one shaft sample is
+# reachable unobstructed.
+_HARM_SHAFT_SAMPLES = (0.15, 0.35, 0.5, 0.65, 0.85)
 
 
 def _read_mesh_numpy(mesh_obj):
@@ -737,15 +744,32 @@ def compute_weights_harmonic(data):
     n_contested = int(contested.sum())
     log(f"Harmonic: {n_contested}/{V} contested verts get visibility tests")
 
-    def _closest_on_seg(p, a, b):
-        ab = b - a
-        ab2 = ab.dot(ab)
-        if ab2 < 1e-12:
-            return a
-        t = max(0.0, min(1.0, (p - a).dot(ab) / ab2))
-        return a + ab * t
+    ray_counter = [0]
 
-    ray_tests = 0
+    def _bone_visible(p, a, b):
+        """True iff some point along the bone SHAFT is reachable from p without
+        the mesh surface in between (i.e. without crossing an air gap). Sampling
+        the shaft (not the closest point) is what makes this gap-aware: a tip
+        buried in shared joint flesh is never used as the target."""
+        ab = b - a
+        ab2 = float(ab.dot(ab))
+        for tt in _HARM_SHAFT_SAMPLES:
+            q = a if ab2 < 1e-12 else (a + ab * tt)
+            d = q - p
+            dist = float(np.linalg.norm(d))
+            if dist < eps:
+                return True
+            dirv = d / dist
+            origin = _V((p[0] + dirv[0] * eps, p[1] + dirv[1] * eps, p[2] + dirv[2] * eps))
+            direction = _V((dirv[0], dirv[1], dirv[2]))
+            ray_counter[0] += 1
+            hit = bvh.ray_cast(origin, direction, dist - 2 * eps)
+            if hit[0] is None:
+                return True  # a shaft point is in clear line of sight
+            if ab2 < 1e-12:
+                break
+        return False
+
     for vi in range(V):
         c0 = int(cand[vi, 0])
         if not contested[vi]:
@@ -760,25 +784,15 @@ def compute_weights_harmonic(data):
             if db > nearest_d[vi] * _HARM_REACH:
                 break
             bidx = int(cand[vi, kk])
-            # visibility ray test: vertex -> closest point on bone segment
-            cpt = _closest_on_seg(p, heads[bidx], tails[bidx])
-            d = cpt - p
-            dist = float(np.linalg.norm(d))
-            if dist < eps:
-                sel_bones.append(bidx); sel_d.append(db); continue
-            dirv = d / dist
-            origin = _V((p[0] + dirv[0] * eps, p[1] + dirv[1] * eps, p[2] + dirv[2] * eps))
-            direction = _V((dirv[0], dirv[1], dirv[2]))
-            ray_tests += 1
-            hit = bvh.ray_cast(origin, direction, dist - 2 * eps)
-            if hit[0] is None:
-                sel_bones.append(bidx); sel_d.append(db)  # unobstructed -> visible
-            # else blocked -> skip this bone
+            if _bone_visible(p, heads[bidx], tails[bidx]):
+                sel_bones.append(bidx); sel_d.append(db)
+            # else blocked across a gap -> not seeded
         # seed weights ~ 1/d^2 (steep), normalized to sum 1
         inv = np.array([1.0 / (dd * dd + 1e-12) for dd in sel_d])
         inv /= inv.sum()
         for bidx, w in zip(sel_bones, inv):
             rows.append(vi); cols.append(bidx); vals.append(float(w))
+    ray_tests = ray_counter[0]
     log(f"Harmonic: visibility {round(time.time()-t_v,2)}s ({ray_tests} ray tests)")
 
     P = sp.coo_matrix((vals, (rows, cols)), shape=(V, B)).tocsc()
@@ -820,16 +834,20 @@ def compute_weights_harmonic(data):
 
     # --- 4b. VISIBILITY MASK (the anti-gap-bleed step) ---------------------
     # The harmonic solve diffuses weight along mesh connectivity, so a bone's
-    # influence leaks across short surface folds (arm seed -> over the shoulder
-    # -> down the side torso / under the arm). Connectivity diffusion can't see
-    # the air gap. So we enforce the physical rule directly: a bone may only
-    # keep weight on a vertex it can SEE -- the straight segment vertex->bone is
-    # not blocked by the mesh surface. A vertex's own-limb bone is reached
-    # through solid flesh (no surface crossing) -> visible; a bone across a gap
-    # is occluded by the surface the ray exits/enters -> masked. The nearest
-    # bone is always kept so no vertex is ever fully zeroed by masking.
+    # influence leaks across short surface folds and even to far parts (arm ->
+    # side torso, arm -> hair). Connectivity diffusion can't see the air gap. So
+    # we enforce the physical rule directly: a bone may only keep weight on a
+    # vertex whose SHAFT it can see -- a straight segment vertex->shaft-point not
+    # blocked by the mesh surface. A vertex's own-limb bone is reached through
+    # solid flesh (no surface crossing) -> visible; a bone across a gap is
+    # occluded by the surface the ray exits/enters -> masked. Sampling the SHAFT
+    # (not the closest point) is essential: the upper-arm head sits inside the
+    # shoulder, reachable from the side torso through solid, so closest-point
+    # targeting misses that leak. The nearest bone is always kept so no vertex
+    # is ever fully zeroed by masking.
     t_m = time.time()
-    mask_tests = 0
+    ray_counter[0] = 0
+    mask_pair_tests = 0
     masked_pairs = 0
     nzcount = (W > _HARM_WMIN).sum(axis=1)
     multi = np.where(nzcount > 1)[0]
@@ -840,21 +858,13 @@ def compute_weights_harmonic(data):
             b = int(b)
             if b == nb:
                 continue
-            cpt = _closest_on_seg(p, heads[b], tails[b])
-            d = cpt - p
-            dist = float(np.linalg.norm(d))
-            if dist < eps:
-                continue
-            dirv = d / dist
-            origin = _V((p[0] + dirv[0] * eps, p[1] + dirv[1] * eps, p[2] + dirv[2] * eps))
-            direction = _V((dirv[0], dirv[1], dirv[2]))
-            mask_tests += 1
-            hit = bvh.ray_cast(origin, direction, dist - 2 * eps)
-            if hit[0] is not None:  # surface in the way -> bone is across a gap
+            mask_pair_tests += 1
+            if not _bone_visible(p, heads[b], tails[b]):  # across a gap
                 W[vi, b] = 0.0
                 masked_pairs += 1
+    mask_tests = ray_counter[0]
     log(f"Harmonic: visibility mask {round(time.time()-t_m,2)}s "
-        f"({mask_tests} tests, {masked_pairs} bleed pairs killed)")
+        f"({mask_pair_tests} pairs, {mask_tests} rays, {masked_pairs} bleed pairs killed)")
 
     # --- 4c. max-4 influences, normalize partition of unity ---
     if B > _HARM_MAX_INFLUENCES:
