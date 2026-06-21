@@ -1147,6 +1147,62 @@ def _voxel_bone_sources(heads, tails, origin, cell, vid, solid, centers):
 _VOX_WIN_LO = 1.5      # ratio d_b/d_min below which a bone contributes fully
 _VOX_WIN_HI = 2.5      # ratio above which it's fully suppressed (gap kill)
 _VOX_SMOOTH_ITERS = 10  # Laplacian smoothing passes on the voxel graph
+_VOX_DENSE_GATE = 2.0  # densify: seed voxel to nearest bone iff geodesic <= gate*euclid+slack
+
+
+def _euclid_nearest_seg(pts, heads, tails):
+    """For each point, return (nearest_bone_index, distance) by point-to-segment
+    Euclidean distance to every bone."""
+    import numpy as np
+    M = pts.shape[0]
+    B = heads.shape[0]
+    ab = tails - heads
+    ab2 = np.maximum((ab * ab).sum(1), 1e-12)
+    best_b = np.zeros(M, np.int64)
+    best_d = np.full(M, np.inf)
+    for b in range(B):
+        ap = pts - heads[b]
+        t = np.clip((ap @ ab[b]) / ab2[b], 0.0, 1.0)
+        proj = heads[b] + t[:, None] * ab[b]
+        dd = np.linalg.norm(pts - proj, axis=1)
+        upd = dd < best_d
+        best_d[upd] = dd[upd]
+        best_b[upd] = b
+    return best_b, best_d
+
+
+def _densify_sources(G, bone_sources, centers, heads, tails, M, B, cell,
+                     gate=_VOX_DENSE_GATE):
+    """Geodesic-gated dense Voronoi seeding — the core robustness fix.
+
+    The bone segments come from getBoneSegments, which gives LEAF bones (hand,
+    head, breast, toe) only a tiny 0.15x stub. Seeding sources only where that
+    stub crosses voxels starves the leaf's region, so the long parent bone
+    (lowerarm/spine/neck) out-reaches it and "wins" the hand/head/breast. Pure
+    Euclidean Voronoi seeding would fix that but reintroduces gap-jumps (an arm
+    grabbing a nearby-in-space-but-far-through-the-body ponytail).
+
+    This combines both: run an initial geodesic from the sparse stubs, then add
+    each voxel to its Euclidean-nearest bone ONLY IF the geodesic distance to
+    that bone is not a long detour (<= gate*euclid + slack). Result: every bone
+    densely owns its true volumetric region, while voxels separated by an air
+    gap (geodesic >> euclid) are NOT seeded across the gap."""
+    import numpy as np
+    import scipy.sparse.csgraph as csg
+    D0 = np.full((M, B), np.inf, dtype=np.float64)
+    for b in range(B):
+        src = bone_sources[b]
+        if src.size:
+            D0[:, b] = csg.dijkstra(G, directed=False, indices=src, min_only=True)
+    nb, ed = _euclid_nearest_seg(centers, heads, tails)
+    slack = 3.0 * cell
+    d0_at = D0[np.arange(M), nb]
+    keep = np.isfinite(d0_at) & (d0_at <= gate * ed + slack)
+    out = [set(s.tolist()) for s in bone_sources]
+    sel = np.where(keep)[0]
+    for v in sel.tolist():
+        out[int(nb[v])].add(v)
+    return [np.array(sorted(s), dtype=np.int64) for s in out]
 
 
 def _solve_voxel_geodesic(G, A, M, bone_sources, B, cell):
@@ -1316,8 +1372,14 @@ def compute_weights_voxel(data):
     vid, M, G, A, occ = _build_voxel_graph(solid, cell)
     centers = origin[None, :] + (occ + 0.5) * cell
     bone_sources = _voxel_bone_sources(heads, tails, origin, cell, vid, solid, centers)
+    n_src_sparse = int(sum(s.size for s in bone_sources))
+    # Geodesic-gated dense Voronoi seeding: give every bone (esp. leaf bones
+    # like hand/head/breast that get a tiny stub from getBoneSegments) its full
+    # volumetric region, while rejecting gap-jumps. This is the structural fix
+    # for lowerarm->hand, spine->breast, neck->head, and thigh<->thigh bleed.
+    bone_sources = _densify_sources(G, bone_sources, centers, heads, tails, M, B, cell)
     n_src = int(sum(s.size for s in bone_sources))
-    log(f"Voxel: graph {M} nodes, {G.nnz//2} edges, {n_src} source voxels in {round(time.time()-t_g,2)}s")
+    log(f"Voxel: graph {M} nodes, {G.nnz//2} edges, {n_src_sparse}->{n_src} source voxels (gated dense) in {round(time.time()-t_g,2)}s")
 
     # --- 3. per-bone geodesic influence through the volume -------------------
     t_s = time.time()
