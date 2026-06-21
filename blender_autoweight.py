@@ -815,8 +815,48 @@ def compute_weights_harmonic(data):
             W[:, b] = x
     log(f"Harmonic: solve {round(time.time()-t_s,2)}s")
 
-    # --- 4. clamp negatives, max-4 influences, normalize partition of unity ---
+    # --- 4. clamp negatives ---
     np.clip(W, 0.0, None, out=W)
+
+    # --- 4b. VISIBILITY MASK (the anti-gap-bleed step) ---------------------
+    # The harmonic solve diffuses weight along mesh connectivity, so a bone's
+    # influence leaks across short surface folds (arm seed -> over the shoulder
+    # -> down the side torso / under the arm). Connectivity diffusion can't see
+    # the air gap. So we enforce the physical rule directly: a bone may only
+    # keep weight on a vertex it can SEE -- the straight segment vertex->bone is
+    # not blocked by the mesh surface. A vertex's own-limb bone is reached
+    # through solid flesh (no surface crossing) -> visible; a bone across a gap
+    # is occluded by the surface the ray exits/enters -> masked. The nearest
+    # bone is always kept so no vertex is ever fully zeroed by masking.
+    t_m = time.time()
+    mask_tests = 0
+    masked_pairs = 0
+    nzcount = (W > _HARM_WMIN).sum(axis=1)
+    multi = np.where(nzcount > 1)[0]
+    for vi in multi.tolist():
+        nb = int(cand[vi, 0])  # nearest bone: always allowed
+        p = co[vi]
+        for b in np.where(W[vi] > _HARM_WMIN)[0].tolist():
+            b = int(b)
+            if b == nb:
+                continue
+            cpt = _closest_on_seg(p, heads[b], tails[b])
+            d = cpt - p
+            dist = float(np.linalg.norm(d))
+            if dist < eps:
+                continue
+            dirv = d / dist
+            origin = _V((p[0] + dirv[0] * eps, p[1] + dirv[1] * eps, p[2] + dirv[2] * eps))
+            direction = _V((dirv[0], dirv[1], dirv[2]))
+            mask_tests += 1
+            hit = bvh.ray_cast(origin, direction, dist - 2 * eps)
+            if hit[0] is not None:  # surface in the way -> bone is across a gap
+                W[vi, b] = 0.0
+                masked_pairs += 1
+    log(f"Harmonic: visibility mask {round(time.time()-t_m,2)}s "
+        f"({mask_tests} tests, {masked_pairs} bleed pairs killed)")
+
+    # --- 4c. max-4 influences, normalize partition of unity ---
     if B > _HARM_MAX_INFLUENCES:
         keep = np.argpartition(W, B - _HARM_MAX_INFLUENCES, axis=1)[:, -_HARM_MAX_INFLUENCES:]
         mask = np.zeros_like(W, dtype=bool)
@@ -874,6 +914,8 @@ def compute_weights_harmonic(data):
                 'pin_h': round(h, 6),
                 'contested_verts': n_contested,
                 'ray_tests': ray_tests,
+                'mask_tests': mask_tests,
+                'bleed_pairs_killed': masked_pairs,
                 'candidates': K,
             },
             'bone_weight_stats': bone_weight_stats,
