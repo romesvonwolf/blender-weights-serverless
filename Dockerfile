@@ -27,6 +27,18 @@ RUN curl -fsSL "https://download.blender.org/release/Blender${BLENDER_SERIES}/bl
 ENV BLENDER_BIN=/opt/blender/blender
 ENV AUTOWEIGHT_SCRIPT=/app/blender_autoweight.py
 
+# The principled harmonic weight solver needs scipy/numpy INSIDE Blender's
+# bundled Python (not the system python). Install with Blender's own python so
+# wheels match its CPython ABI exactly, then verify Blender can import them at
+# build time (fail the build if not). If this layer is ever removed, the
+# autoweight script simply falls back to bone-heat.
+RUN PYBIN="$(ls /opt/blender/${BLENDER_SERIES}/python/bin/python3* | head -n1)" \
+    && echo "Blender python: $PYBIN" \
+    && ("$PYBIN" -m ensurepip --upgrade || true) \
+    && "$PYBIN" -m pip install --no-cache-dir --upgrade pip \
+    && "$PYBIN" -m pip install --no-cache-dir scipy \
+    && /opt/blender/blender --background --python-expr "import numpy, scipy; print('blender-scipy-ok', numpy.__version__, scipy.__version__)"
+
 WORKDIR /app
 
 RUN pip install --no-cache-dir runpod

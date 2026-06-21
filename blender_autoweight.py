@@ -544,7 +544,362 @@ def extract_weights(mesh_obj, V):
     return weights, zero_weight_count
 
 
+def _prepare_scene(data):
+    """Clear the scene, build the mesh from raw verts/tris, and repair topology.
+
+    Shared by both the harmonic and bone-heat paths so they operate on the
+    SAME repaired mesh (and therefore the same vertex indexing the client
+    expects). Returns (mesh_obj, input_V, input_T, dupe_faces, repaired_V).
+    """
+    vertices = data['vertices']
+    triangles = data['triangles']
+
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete(use_global=False)
+    for block in bpy.data.meshes:
+        if block.users == 0:
+            bpy.data.meshes.remove(block)
+    for block in bpy.data.armatures:
+        if block.users == 0:
+            bpy.data.armatures.remove(block)
+
+    mesh_data = bpy.data.meshes.new('WeightMesh')
+    bm = bmesh.new()
+    bm_verts = []
+    for v in vertices:
+        bm_verts.append(bm.verts.new(Vector(v)))
+    bm.verts.ensure_lookup_table()
+    dupe_faces = 0
+    for tri in triangles:
+        try:
+            bm.faces.new([bm_verts[tri[0]], bm_verts[tri[1]], bm_verts[tri[2]]])
+        except ValueError:
+            dupe_faces += 1
+    bm.to_mesh(mesh_data)
+    bm.free()
+    mesh_data.update()
+
+    mesh_obj = bpy.data.objects.new('WeightMesh', mesh_data)
+    bpy.context.collection.objects.link(mesh_obj)
+    log(f"Mesh created: {len(mesh_data.vertices)} verts, {len(mesh_data.polygons)} faces (skipped {dupe_faces} dupes)")
+
+    repaired_V = repair_mesh(mesh_obj)
+    return mesh_obj, len(vertices), len(triangles), dupe_faces, repaired_V
+
+
+# ===========================================================================
+# Harmonic + bone-visibility solver (the principled core)
+# ===========================================================================
+# Instead of Blender bone-heat + a tower of anatomy-specific cleanup, we solve
+# for smooth, bounded, partition-of-unity weights directly:
+#
+#   1. Bone visibility: a vertex only seeds from bones it can "see" (the
+#      straight line vertex->bone is not blocked by the mesh surface). An
+#      inner-thigh vertex cannot see the OTHER leg's bone, so cross-leg bleed
+#      is structurally impossible -- no midline/anatomy hacks needed.
+#   2. Seeds: among the nearest visible bones, seed targets are 1/d^2 weighted
+#      (steep falloff so the own-limb bone dominates) and normalized to 1.
+#   3. Harmonic solve: (L + h*I) W = h*P, where L is the cotangent Laplacian.
+#      Because per-vertex P sums to 1 and (L+hI)*1 = h*1, the solution is a
+#      partition of unity by construction -- smooth, bounded, no speckle.
+#
+# numpy/scipy are imported lazily so this module still loads (and falls back to
+# bone-heat) on an image that hasn't been rebuilt with scipy yet.
+
+# Tunable internals (NOT user-facing; derived/auto-scaled where possible).
+_HARM_MAX_CANDIDATES = 8     # nearest bones considered per vertex
+_HARM_REACH = 3.0            # only contest bones within REACH x nearest distance
+_HARM_PIN_FACTOR = 1.0       # pin stiffness vs Laplacian scale (higher = sharper)
+_HARM_MAX_INFLUENCES = 4
+_HARM_WMIN = 1e-4
+_HARM_CG_MAXITER = 400
+
+
+def _read_mesh_numpy(mesh_obj):
+    """Pull repaired-mesh geometry into numpy: (co Vx3, normals Vx3, tris Fx3)."""
+    import numpy as np
+    mesh = mesh_obj.data
+    mesh.calc_loop_triangles()
+    n = len(mesh.vertices)
+    co = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get('co', co)
+    co = co.reshape(-1, 3)
+    nrm = np.empty(n * 3, dtype=np.float64)
+    mesh.vertices.foreach_get('normal', nrm)
+    nrm = nrm.reshape(-1, 3)
+    m = len(mesh.loop_triangles)
+    tri = np.empty(m * 3, dtype=np.int64)
+    mesh.loop_triangles.foreach_get('vertices', tri)
+    tri = tri.reshape(-1, 3)
+    return co, nrm, tri
+
+
+def _cotangent_laplacian(co, tri):
+    """Sparse cotangent Laplacian L = D - W (V x V), clamped for sliver tris."""
+    import numpy as np
+    import scipy.sparse as sp
+    V = co.shape[0]
+    i1, i2, i3 = tri[:, 0], tri[:, 1], tri[:, 2]
+    v1, v2, v3 = co[i1], co[i2], co[i3]
+    cross = np.cross(v2 - v1, v3 - v1)
+    area2 = np.linalg.norm(cross, axis=1)
+    area2 = np.maximum(area2, 1e-12)
+    # cot of angle at each vertex = dot(edge1, edge2) / (2*area)
+    cot1 = np.einsum('ij,ij->i', v2 - v1, v3 - v1) / area2
+    cot2 = np.einsum('ij,ij->i', v1 - v2, v3 - v2) / area2
+    cot3 = np.einsum('ij,ij->i', v1 - v3, v2 - v3) / area2
+    np.clip(cot1, -1e3, 1e3, out=cot1)
+    np.clip(cot2, -1e3, 1e3, out=cot2)
+    np.clip(cot3, -1e3, 1e3, out=cot3)
+    # angle at i1 (cot1) is opposite edge (i2,i3), etc.
+    rows = np.concatenate([i2, i3, i3, i1, i1, i2])
+    cols = np.concatenate([i3, i2, i1, i3, i2, i1])
+    vals = np.concatenate([cot1, cot1, cot2, cot2, cot3, cot3]) * 0.5
+    W = sp.coo_matrix((vals, (rows, cols)), shape=(V, V)).tocsr()
+    diag = np.asarray(W.sum(axis=1)).ravel()
+    L = sp.diags(diag) - W
+    return L
+
+
+def _bone_arrays(bones):
+    import numpy as np
+    names = [b['name'] for b in bones]
+    heads = np.array([b['head'] for b in bones], dtype=np.float64)
+    tails = np.array([b['tail'] for b in bones], dtype=np.float64)
+    return names, heads, tails
+
+
+def _all_bone_distances(co, heads, tails):
+    """(V,B) point-to-segment distances, vectorized over vertices per bone."""
+    import numpy as np
+    V = co.shape[0]
+    B = heads.shape[0]
+    D = np.empty((V, B), dtype=np.float64)
+    for b in range(B):
+        a = heads[b]
+        ab = tails[b] - a
+        ab2 = float(ab.dot(ab))
+        if ab2 < 1e-12:
+            D[:, b] = np.linalg.norm(co - a, axis=1)
+        else:
+            t = ((co - a) @ ab) / ab2
+            np.clip(t, 0.0, 1.0, out=t)
+            proj = a[None, :] + t[:, None] * ab[None, :]
+            D[:, b] = np.linalg.norm(co - proj, axis=1)
+    return D
+
+
+def compute_weights_harmonic(data):
+    t0 = time.time()
+    import numpy as np
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    from mathutils import Vector as _V
+    from mathutils.bvhtree import BVHTree
+
+    mesh_obj, V_in, T_in, dupe_faces, repaired_V = _prepare_scene(data)
+    bones = data['bones']
+    B = len(bones)
+    names, heads, tails = _bone_arrays(bones)
+
+    co, nrm, tri = _read_mesh_numpy(mesh_obj)
+    V = co.shape[0]
+    log(f"Harmonic: {V} verts, {tri.shape[0]} tris, {B} bones")
+
+    bbox = co.max(axis=0) - co.min(axis=0)
+    diag_len = float(np.linalg.norm(bbox)) or 1.0
+    eps = diag_len * 1e-4
+
+    # --- 1. nearest-K bone candidates per vertex ---
+    t_d = time.time()
+    D = _all_bone_distances(co, heads, tails)
+    K = min(_HARM_MAX_CANDIDATES, B)
+    cand = np.argpartition(D, K - 1, axis=1)[:, :K]  # (V,K) unsorted top-K
+    cand_d = np.take_along_axis(D, cand, axis=1)
+    order = np.argsort(cand_d, axis=1)
+    cand = np.take_along_axis(cand, order, axis=1)
+    cand_d = np.take_along_axis(cand_d, order, axis=1)
+    nearest_d = cand_d[:, 0]
+    log(f"Harmonic: candidate distances {round(time.time()-t_d,2)}s")
+
+    # --- 2. bone visibility (only for contested verts, only contested cands) ---
+    t_v = time.time()
+    bvh = BVHTree.FromObject(mesh_obj, bpy.context.evaluated_depsgraph_get())
+    seg_pt = np.empty(3, dtype=np.float64)
+
+    # rows/cols/data for the seed matrix P (V x B), sum-to-1 per vertex.
+    rows = []
+    cols = []
+    vals = []
+
+    # contested = 2nd-nearest bone is within REACH x nearest -> ambiguous region.
+    contested = cand_d[:, 1] <= (nearest_d * _HARM_REACH) if K > 1 else np.zeros(V, bool)
+    n_contested = int(contested.sum())
+    log(f"Harmonic: {n_contested}/{V} contested verts get visibility tests")
+
+    def _closest_on_seg(p, a, b):
+        ab = b - a
+        ab2 = ab.dot(ab)
+        if ab2 < 1e-12:
+            return a
+        t = max(0.0, min(1.0, (p - a).dot(ab) / ab2))
+        return a + ab * t
+
+    ray_tests = 0
+    for vi in range(V):
+        c0 = int(cand[vi, 0])
+        if not contested[vi]:
+            rows.append(vi); cols.append(c0); vals.append(1.0)
+            continue
+        p = co[vi]
+        # nearest bone is always allowed (auto-visible)
+        sel_bones = [c0]
+        sel_d = [cand_d[vi, 0]]
+        for kk in range(1, K):
+            db = cand_d[vi, kk]
+            if db > nearest_d[vi] * _HARM_REACH:
+                break
+            bidx = int(cand[vi, kk])
+            # visibility ray test: vertex -> closest point on bone segment
+            cpt = _closest_on_seg(p, heads[bidx], tails[bidx])
+            d = cpt - p
+            dist = float(np.linalg.norm(d))
+            if dist < eps:
+                sel_bones.append(bidx); sel_d.append(db); continue
+            dirv = d / dist
+            origin = _V((p[0] + dirv[0] * eps, p[1] + dirv[1] * eps, p[2] + dirv[2] * eps))
+            direction = _V((dirv[0], dirv[1], dirv[2]))
+            ray_tests += 1
+            hit = bvh.ray_cast(origin, direction, dist - 2 * eps)
+            if hit[0] is None:
+                sel_bones.append(bidx); sel_d.append(db)  # unobstructed -> visible
+            # else blocked -> skip this bone
+        # seed weights ~ 1/d^2 (steep), normalized to sum 1
+        inv = np.array([1.0 / (dd * dd + 1e-12) for dd in sel_d])
+        inv /= inv.sum()
+        for bidx, w in zip(sel_bones, inv):
+            rows.append(vi); cols.append(bidx); vals.append(float(w))
+    log(f"Harmonic: visibility {round(time.time()-t_v,2)}s ({ray_tests} ray tests)")
+
+    P = sp.coo_matrix((vals, (rows, cols)), shape=(V, B)).tocsc()
+
+    # --- 3. harmonic solve (L + h I) W = h P, factor once, solve per bone ---
+    t_s = time.time()
+    L = _cotangent_laplacian(co, tri)
+    Ldiag = L.diagonal()
+    h = float(np.median(Ldiag[Ldiag > 0])) * _HARM_PIN_FACTOR
+    if not np.isfinite(h) or h <= 0:
+        h = 1.0
+    A = (L + h * sp.identity(V, format='csr')).tocsc()
+
+    solve = None
+    try:
+        solve = spla.factorized(A)  # SuperLU; fast for many RHS
+        log("Harmonic: using SuperLU factorization")
+    except Exception as e:
+        log(f"Harmonic: splu failed ({e}); using CG")
+
+    Mdiag = None
+    if solve is None:
+        Mdiag = spla.LinearOperator((V, V), matvec=lambda x: x / A.diagonal())
+
+    W = np.zeros((V, B), dtype=np.float64)
+    for b in range(B):
+        rhs = h * np.asarray(P[:, b].todense()).ravel()
+        if rhs.max() <= 0:
+            continue
+        if solve is not None:
+            W[:, b] = solve(rhs)
+        else:
+            x, _info = spla.cg(A, rhs, M=Mdiag, maxiter=_HARM_CG_MAXITER)
+            W[:, b] = x
+    log(f"Harmonic: solve {round(time.time()-t_s,2)}s")
+
+    # --- 4. clamp negatives, max-4 influences, normalize partition of unity ---
+    np.clip(W, 0.0, None, out=W)
+    if B > _HARM_MAX_INFLUENCES:
+        keep = np.argpartition(W, B - _HARM_MAX_INFLUENCES, axis=1)[:, -_HARM_MAX_INFLUENCES:]
+        mask = np.zeros_like(W, dtype=bool)
+        np.put_along_axis(mask, keep, True, axis=1)
+        W[~mask] = 0.0
+    rowsum = W.sum(axis=1)
+    zero_weight_count = int((rowsum < 1e-8).sum())
+    # rescue any all-zero vertex to its nearest bone
+    if zero_weight_count:
+        zidx = np.where(rowsum < 1e-8)[0]
+        W[zidx, cand[zidx, 0]] = 1.0
+        rowsum[zidx] = 1.0
+    W /= rowsum[:, None]
+
+    # --- 5. build sparse weights dict {bone: {vi: w}} ---
+    t_e = time.time()
+    weights = {}
+    nz_v, nz_b = np.where(W > _HARM_WMIN)
+    for vi, b in zip(nz_v.tolist(), nz_b.tolist()):
+        bucket = weights.get(names[b])
+        if bucket is None:
+            bucket = {}
+            weights[names[b]] = bucket
+        bucket[str(vi)] = round(float(W[vi, b]), 6)
+    log(f"Harmonic: extract {round(time.time()-t_e,2)}s, {len(weights)} bones")
+
+    elapsed = time.time() - t0
+    bone_weight_stats = {}
+    for bname, bw in weights.items():
+        ws = list(bw.values())
+        bone_weight_stats[bname] = {
+            'verts': len(ws),
+            'min_w': round(min(ws), 4) if ws else 0,
+            'max_w': round(max(ws), 4) if ws else 0,
+            'avg_w': round(sum(ws) / len(ws), 4) if ws else 0,
+        }
+    debug_vert_positions = [[round(float(co[vi, 0]), 5), round(float(co[vi, 1]), 5),
+                             round(float(co[vi, 2]), 5)] for vi in range(min(repaired_V, 5000))]
+    log(f"Harmonic done: {len(weights)} bones, {zero_weight_count} zero verts, {elapsed:.1f}s")
+
+    return {
+        'weights': weights,
+        'bone_count': len(weights),
+        'weight_method': 'HARMONIC_VISIBILITY',
+        'diagnostics': {
+            'input_verts': V_in,
+            'input_tris': T_in,
+            'repaired_verts': repaired_V,
+            'duplicate_faces': dupe_faces,
+            'zero_weight_verts': zero_weight_count,
+            'bones_with_weights': len(weights),
+            'bones_requested': B,
+            'solver': {
+                'method': 'harmonic_visibility',
+                'pin_h': round(h, 6),
+                'contested_verts': n_contested,
+                'ray_tests': ray_tests,
+                'candidates': K,
+            },
+            'bone_weight_stats': bone_weight_stats,
+            'debug_vert_positions': debug_vert_positions,
+            'timing': {
+                'total_s': round(elapsed, 2),
+            },
+        },
+        'elapsed': round(elapsed, 2),
+    }
+
+
 def compute_weights(data):
+    """Dispatch: harmonic (principled) by default, bone-heat as fallback."""
+    method = (data.get('method') or 'harmonic').lower()
+    if method in ('harmonic', 'visibility', 'harmonic_visibility'):
+        try:
+            return compute_weights_harmonic(data)
+        except Exception as e:
+            log(f"Harmonic solver failed ({e}); falling back to bone-heat")
+            traceback.print_exc()
+            return compute_weights_bone_heat(data)
+    return compute_weights_bone_heat(data)
+
+
+def compute_weights_bone_heat(data):
     t0 = time.time()
     vertices = data['vertices']
     triangles = data['triangles']

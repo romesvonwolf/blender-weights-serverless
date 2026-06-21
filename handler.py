@@ -150,6 +150,13 @@ def handler(job):
         if k not in data:
             return {"error": f"missing '{k}' in mesh input"}
 
+    # Weight-solver method ('harmonic' default | 'bone_heat'). The mesh blob
+    # (SMW1 binary) can't carry it, so it rides as a top-level job-input field
+    # and we inject it into the data the Blender script reads.
+    method = ji.get("method")
+    if method:
+        data["method"] = method
+
     V = len(data["vertices"])
     T = len(data["triangles"])
     B = len(data["bones"])
