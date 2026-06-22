@@ -1253,6 +1253,162 @@ def _solve_voxel_geodesic(G, A, M, bone_sources, B, cell):
     return W
 
 
+# ── Bounded Biharmonic Weights (BBW) on the voxel grid ───────────────────────
+# The geodesic solver above converts distance->weight with a heuristic 1/d^2
+# falloff + a hard window, so each voxel is solved independently and smoothness
+# is bolted on afterward (10 Laplacian passes). That kinks deformations and lets
+# a long bone win a neighbour's region. BBW instead solves ONE global energy:
+# the weight field that minimizes the discrete biharmonic (bending) energy
+# W^T L^2 W subject to Dirichlet handles (W_b=1 on bone b's voxels, 0 on every
+# other bone's), giving the smoothest field consistent with the bones. Because
+# it lives on the solid voxel graph it cannot cross air gaps. (Jacobson et al.,
+# "Bounded Biharmonic Weights", SIGGRAPH 2011.)
+_VOX_SOLVER = 'biharmonic'      # 'biharmonic' (default) | 'geodesic' (legacy)
+_VOX_BIHARM_MAX_VOX = 300_000   # above this the L^2 factorization is too heavy;
+                                # fall back to the geodesic solver.
+
+# Extremity bones get a tiny stub from getBoneSegments, so they're starved and a
+# long parent bone wins their region. Each extremity claims the voxels
+# geodesically closer to it than to its rival(s). owner -> rival bone names:
+_VOX_EXTREMITIES = (
+    ('head', ('neck_01', 'neck_02', 'neck')),  # rigid head: skull+hair+ponytail
+    ('hand_l', ('lowerarm_l',)), ('hand_r', ('lowerarm_r',)),
+    ('foot_l', ('calf_l',)), ('foot_r', ('calf_r',)),
+    ('ball_l', ('foot_l',)), ('ball_r', ('foot_r',)),
+)
+
+
+def _build_adj6(solid, vid, M):
+    """Unit 6-connectivity adjacency over occupied voxels (face neighbours).
+    The biharmonic stencil L^2 stays sparse (25-point) under 6-conn, unlike the
+    26-conn graph used for geodesic distance."""
+    import numpy as np
+    import scipy.sparse as sp
+    nx, ny, nz = solid.shape
+    rs, cs = [], []
+    for dx, dy, dz in ((1, 0, 0), (0, 1, 0), (0, 0, 1)):
+        a = vid[max(0, -dx):nx - max(0, dx), max(0, -dy):ny - max(0, dy), max(0, -dz):nz - max(0, dz)]
+        b = vid[max(0, dx):nx - max(0, -dx), max(0, dy):ny - max(0, -dy), max(0, dz):nz - max(0, -dz)]
+        m = (a >= 0) & (b >= 0)
+        if not m.any():
+            continue
+        rs.append(a[m]); cs.append(b[m])
+    if not rs:
+        return sp.csr_matrix((M, M), dtype=np.float32)
+    r = np.concatenate(rs); c = np.concatenate(cs)
+    rr = np.concatenate([r, c]); cc = np.concatenate([c, r])
+    return sp.csr_matrix((np.ones(rr.shape[0], dtype=np.float32), (rr, cc)), shape=(M, M))
+
+
+def _voxel_bone_geodesics(G, bone_sources, M, B):
+    """Per-bone geodesic distance field from each bone's sparse handle voxels."""
+    import numpy as np
+    import scipy.sparse.csgraph as csg
+    D = np.full((M, B), np.inf, dtype=np.float64)
+    for b in range(B):
+        src = bone_sources[b]
+        if src.size:
+            D[:, b] = csg.dijkstra(G, directed=False, indices=src, min_only=True)
+    return D
+
+
+def _voxel_anatomy_priors(bone_sources, names, G, centers, cell, M, B):
+    """Augment the sparse bone handles with humanoid anatomy (the rig is always
+    the same UE5/SMPL skeleton, so this is safe):
+      - rigid head : head owns every voxel geodesically closer to the head bone
+                     than to the neck bones (skull + hair + ponytail); removed
+                     from neck handles so the neck can't paint the hair.
+      - rigid hands/feet/toes: each extremity owns voxels geodesically closer to
+                     it than to its parent (whole hand past the wrist, foot past
+                     the ankle, toes), removed from the parent handle.
+      - strict L/R: a side bone's handle is clipped to its own side of the x=0
+                    sagittal plane (kills thigh<->opposite-thigh / arm cross).
+    Mirrors apply_anatomy_priors in scripts/weight-lab/local_voxel_solve.py."""
+    import numpy as np
+    name_idx = {n: i for i, n in enumerate(names)}
+    out = [set(s.tolist()) for s in bone_sources]
+    D = _voxel_bone_geodesics(G, bone_sources, M, B)
+
+    def gd(bn):
+        return D[:, name_idx[bn]] if bn in name_idx else np.full(M, np.inf)
+
+    def region_to(owner, rivals):
+        own = gd(owner)
+        rv = [gd(r) for r in rivals if r in name_idx]
+        riv = np.minimum.reduce(rv) if rv else np.full(M, np.inf)
+        return np.isfinite(own) & (own <= riv)
+
+    for owner, rivals in _VOX_EXTREMITIES:
+        rivals = tuple(r for r in rivals if r in name_idx)
+        if owner not in name_idx or not rivals:
+            continue
+        sel = set(np.where(region_to(owner, rivals))[0].tolist())
+        out[name_idx[owner]] |= sel
+        for r in rivals:
+            out[name_idx[r]] -= sel
+
+    x = centers[:, 0]
+    margin = 2.0 * cell
+    right_side = set(np.where(x > margin)[0].tolist())
+    left_side = set(np.where(x < -margin)[0].tolist())
+    for bn, i in name_idx.items():
+        if bn.endswith('_l'):
+            out[i] -= right_side
+        elif bn.endswith('_r'):
+            out[i] -= left_side
+
+    return [np.array(sorted(out[i]), dtype=np.int64) if out[i] else bone_sources[i]
+            for i in range(B)]
+
+
+def _solve_voxel_biharmonic(A6, M, bone_sources, B, reg=1e-8):
+    """Bounded Biharmonic Weights. Minimize W^T L^2 W with Dirichlet handles
+    (W_b=1 on bone b's handle, 0 on others). Partition voxels into constrained C
+    (union of all handles) and free F, solve Q_FF W_F = -Q_FC W_C with a single
+    sparse LU factorization (multi-RHS), then clamp to [0,1] and normalize to a
+    partition of unity. Returns W (M x B) float32."""
+    import numpy as np
+    import scipy.sparse as sp
+    import scipy.sparse.linalg as spla
+    deg = np.asarray(A6.sum(axis=1)).ravel()
+    L = (sp.diags(deg) - A6).tocsr()
+    Q = (L @ L).tocsc()
+
+    is_c = np.zeros(M, dtype=bool)
+    for s in bone_sources:
+        if s.size:
+            is_c[s] = True
+    Cidx = np.where(is_c)[0]
+    Fidx = np.where(~is_c)[0]
+    if Cidx.size == 0 or Fidx.size == 0:
+        raise RuntimeError('biharmonic: degenerate constraint set')
+    cpos = -np.ones(M, dtype=np.int64)
+    cpos[Cidx] = np.arange(Cidx.size)
+
+    Wc = np.zeros((Cidx.size, B), dtype=np.float64)
+    for b in range(B):
+        if bone_sources[b].size:
+            Wc[cpos[bone_sources[b]], b] = 1.0
+    rs = Wc.sum(axis=1)
+    rs[rs == 0] = 1.0
+    Wc /= rs[:, None]  # voxels claimed by >1 bone -> split evenly
+
+    Qff = (Q[Fidx][:, Fidx] + reg * sp.identity(Fidx.size, format='csc')).tocsc()
+    Qfc = Q[Fidx][:, Cidx].tocsc()
+    rhs = -(Qfc @ Wc)
+    lu = spla.splu(Qff)
+    Wf = lu.solve(np.asarray(rhs))
+
+    W = np.zeros((M, B), dtype=np.float32)
+    W[Cidx] = Wc
+    W[Fidx] = Wf
+    np.clip(W, 0.0, 1.0, out=W)
+    rs = W.sum(axis=1)
+    rs[rs < 1e-12] = 1.0
+    W /= rs[:, None]
+    return W
+
+
 def _transfer_voxels_to_verts(co, origin, cell, vid, W_vox, centers):
     """Trilinear interpolation of per-bone voxel weights onto surface verts."""
     import numpy as np
@@ -1373,18 +1529,36 @@ def compute_weights_voxel(data):
     centers = origin[None, :] + (occ + 0.5) * cell
     bone_sources = _voxel_bone_sources(heads, tails, origin, cell, vid, solid, centers)
     n_src_sparse = int(sum(s.size for s in bone_sources))
-    # Geodesic-gated dense Voronoi seeding: give every bone (esp. leaf bones
-    # like hand/head/breast that get a tiny stub from getBoneSegments) its full
-    # volumetric region, while rejecting gap-jumps. This is the structural fix
-    # for lowerarm->hand, spine->breast, neck->head, and thigh<->thigh bleed.
-    bone_sources = _densify_sources(G, bone_sources, centers, heads, tails, M, B, cell)
-    n_src = int(sum(s.size for s in bone_sources))
-    log(f"Voxel: graph {M} nodes, {G.nnz//2} edges, {n_src_sparse}->{n_src} source voxels (gated dense) in {round(time.time()-t_g,2)}s")
+    log(f"Voxel: graph {M} nodes, {G.nnz//2} edges, {n_src_sparse} sparse source voxels in {round(time.time()-t_g,2)}s")
 
-    # --- 3. per-bone geodesic influence through the volume -------------------
-    t_s = time.time()
-    W_vox = _solve_voxel_geodesic(G, A, M, bone_sources, B, cell)
-    log(f"Voxel: volume geodesic solve {round(time.time()-t_s,2)}s")
+    # --- 3. per-bone influence through the volume ----------------------------
+    # Default: Bounded Biharmonic Weights (smooth, volume-aware) with humanoid
+    # anatomy priors on SPARSE handles. Falls back to the legacy geodesic
+    # distance-falloff solver if the biharmonic factorization is too heavy or
+    # errors out (so a single bad mesh can't take the whole service down).
+    W_vox = None
+    if _VOX_SOLVER == 'biharmonic':
+        if M > _VOX_BIHARM_MAX_VOX:
+            log(f"Voxel: {M} voxels > biharmonic cap {_VOX_BIHARM_MAX_VOX}; using geodesic solver")
+        else:
+            try:
+                t_p = time.time()
+                handles = _voxel_anatomy_priors(bone_sources, names, G, centers, cell, M, B)
+                n_h = int(sum(s.size for s in handles))
+                A6 = _build_adj6(solid, vid, M)
+                W_vox = _solve_voxel_biharmonic(A6, M, handles, B)
+                log(f"Voxel: BBW biharmonic solve ({n_src_sparse}->{n_h} handle voxels) "
+                    f"{round(time.time()-t_p,2)}s")
+            except Exception as e:
+                log(f"Voxel: biharmonic solve failed ({e}); falling back to geodesic")
+                W_vox = None
+    if W_vox is None:
+        # Legacy geodesic path: dense Voronoi seeding + 1/d^2 falloff window.
+        bone_sources = _densify_sources(G, bone_sources, centers, heads, tails, M, B, cell)
+        n_src = int(sum(s.size for s in bone_sources))
+        t_s = time.time()
+        W_vox = _solve_voxel_geodesic(G, A, M, bone_sources, B, cell)
+        log(f"Voxel: geodesic solve ({n_src_sparse}->{n_src} dense sources) {round(time.time()-t_s,2)}s")
 
     # --- 4. transfer to surface vertices -------------------------------------
     t_t = time.time()
