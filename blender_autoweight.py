@@ -1537,6 +1537,8 @@ def compute_weights_voxel(data):
     # distance-falloff solver if the biharmonic factorization is too heavy or
     # errors out (so a single bad mesh can't take the whole service down).
     W_vox = None
+    solver_label = 'voxel_geodesic'
+    n_src = n_src_sparse
     if _VOX_SOLVER == 'biharmonic':
         if M > _VOX_BIHARM_MAX_VOX:
             log(f"Voxel: {M} voxels > biharmonic cap {_VOX_BIHARM_MAX_VOX}; using geodesic solver")
@@ -1547,6 +1549,8 @@ def compute_weights_voxel(data):
                 n_h = int(sum(s.size for s in handles))
                 A6 = _build_adj6(solid, vid, M)
                 W_vox = _solve_voxel_biharmonic(A6, M, handles, B)
+                n_src = n_h
+                solver_label = 'voxel_biharmonic'
                 log(f"Voxel: BBW biharmonic solve ({n_src_sparse}->{n_h} handle voxels) "
                     f"{round(time.time()-t_p,2)}s")
             except Exception as e:
@@ -1556,6 +1560,7 @@ def compute_weights_voxel(data):
         # Legacy geodesic path: dense Voronoi seeding + 1/d^2 falloff window.
         bone_sources = _densify_sources(G, bone_sources, centers, heads, tails, M, B, cell)
         n_src = int(sum(s.size for s in bone_sources))
+        solver_label = 'voxel_geodesic'
         t_s = time.time()
         W_vox = _solve_voxel_geodesic(G, A, M, bone_sources, B, cell)
         log(f"Voxel: geodesic solve ({n_src_sparse}->{n_src} dense sources) {round(time.time()-t_s,2)}s")
@@ -1658,7 +1663,7 @@ def compute_weights_voxel(data):
             'bones_with_weights': len(weights),
             'bones_requested': B,
             'solver': {
-                'method': 'voxel_volumetric',
+                'method': solver_label,
                 'voxel_res': res,
                 'voxel_cell': round(cell, 5),
                 'solid_voxels': M0,
