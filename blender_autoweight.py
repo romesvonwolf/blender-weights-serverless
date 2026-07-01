@@ -44,6 +44,7 @@ import bpy
 import bmesh
 import sys
 import json
+import re
 import traceback
 import time
 from mathutils import Vector
@@ -291,6 +292,107 @@ def get_limb_group(bone_name):
             return 'clav_r'
     return 'trunk'
 
+
+
+# Bones whose bone-heat weights notoriously over-reach off their own axis:
+# the clavicle bleeds down into the armpit/side-torso, the upperarm into the
+# chest, the thigh up into the pelvis. Bone heat is distance-based and
+# anatomy-blind, so it can't tell "along the bone" from "far off to the side".
+REACH_BONE_RE = re.compile(r'^(clavicle|upperarm|thigh)_[lr]$')
+
+
+def contain_reach_bones(mesh_obj, armature_obj,
+                        r_keep=0.4, a_keep=0.25, band=0.6, strength=0.8):
+    """Trim over-reaching bones back to their anatomical "tube".
+
+    For each reach bone (clavicle/upperarm/thigh, L+R) we attenuate its weight
+    on vertices that are BOTH radially far from the bone segment (> r_keep·L) OR
+    axially past either end (> a_keep·L beyond head/tail), ramping to zero over
+    band·L. `strength` (0..1) scales how aggressively. A final
+    normalize-all then flows the freed influence into the neighbour bones the
+    vertex already carries — so the clavicle no longer drags the side-torso on
+    an arm raise, matching the subtler hand-authored weighting of DAZ-style rigs.
+    Returns the number of (vertex,bone) weights trimmed.
+    """
+    arm = armature_obj.data
+    binfo = {}
+    for b in arm.bones:
+        if not REACH_BONE_RE.match(b.name):
+            continue
+        h = Vector(b.head_local)
+        ab = Vector(b.tail_local) - h
+        l2 = ab.dot(ab)
+        if l2 < 1e-8:
+            continue
+        binfo[b.name] = (h, ab, l2, l2 ** 0.5)
+
+    if not binfo:
+        log("Reach containment: no clavicle/upperarm/thigh bones present")
+        return 0
+
+    index_to_name = {vg.index: vg.name for vg in mesh_obj.vertex_groups}
+    vg_by_name = {vg.name: vg for vg in mesh_obj.vertex_groups}
+    reach_groups = {n: vg_by_name[n] for n in binfo if n in vg_by_name}
+    if not reach_groups:
+        log("Reach containment: reach bones have no vertex groups")
+        return 0
+
+    mesh = mesh_obj.data
+    updates = {}      # bone name -> list of (vertex index, new weight)
+    trimmed = 0
+    per_bone = {}
+    for vi, vert in enumerate(mesh.vertices):
+        co = vert.co
+        for g in vert.groups:
+            name = index_to_name.get(g.group)
+            if name not in binfo:
+                continue
+            w = g.weight
+            if w <= 0.01:
+                continue
+            h, ab, l2, L = binfo[name]
+            ap = co - h
+            t_raw = ap.dot(ab) / l2
+            t_c = 0.0 if t_raw < 0.0 else 1.0 if t_raw > 1.0 else t_raw
+            closest = h + ab * t_c
+            radial = (co - closest).length
+            axial = (-t_raw * L) if t_raw < 0.0 else ((t_raw - 1.0) * L if t_raw > 1.0 else 0.0)
+            excess = max(radial - r_keep * L, axial - a_keep * L)
+            if excess <= 0.0:
+                continue
+            bnd = max(1e-4, band * L)
+            x = min(1.0, max(0.0, excess / bnd))
+            ss = x * x * (3.0 - 2.0 * x)          # smoothstep 0..1
+            factor = 1.0 - ss * strength           # 1 (keep) .. (1-strength)
+            if factor >= 0.999:
+                continue
+            updates.setdefault(name, []).append((vi, w * factor))
+            trimmed += 1
+            per_bone[name] = per_bone.get(name, 0) + 1
+
+    for name, lst in updates.items():
+        vg = reach_groups[name]
+        for vi, nw in lst:
+            vg.add([vi], nw, 'REPLACE')
+
+    if trimmed > 0:
+        bpy.context.view_layer.objects.active = mesh_obj
+        mesh_obj.select_set(True)
+        bpy.ops.object.mode_set(mode='WEIGHT_PAINT')
+        try:
+            bpy.ops.object.vertex_group_normalize_all(
+                group_select_mode='ALL', lock_active=False)
+        except Exception:
+            pass
+        bpy.ops.object.mode_set(mode='OBJECT')
+        mesh_obj.select_set(False)
+        top = sorted(per_bone.items(), key=lambda x: -x[1])
+        log(f"Reach containment: trimmed {trimmed} over-reach weights "
+            f"({', '.join(f'{n}:{c}' for n, c in top)})")
+    else:
+        log("Reach containment: nothing to trim (weights already tubular)")
+
+    return trimmed
 
 
 def clamp_weights_combined(mesh_obj, armature_obj):
@@ -601,6 +703,14 @@ def compute_weights(data):
     smooth_elapsed = round(time.time() - t_smooth, 2)
     log(f"Smoothing: {smooth_elapsed}s")
 
+    # Reach containment (BEFORE clamping): pull over-reaching bones (clavicle,
+    # upperarm, thigh) back to their anatomical tube so bone-heat's off-axis
+    # bleed (e.g. clavicle → armpit/side-torso) doesn't wreck extreme poses.
+    t_contain = time.time()
+    contain_trimmed = contain_reach_bones(mesh_obj, armature_obj)
+    contain_elapsed = round(time.time() - t_contain, 2)
+    log(f"Reach containment: {contain_elapsed}s")
+
     # Two-phase weight clamping (AFTER smoothing):
     # Phase 1 — Island: strip cross-island bleed (edge connectivity)
     # Phase 2 — Cross-limb distance: strip same-mesh bleed where a bone
@@ -649,12 +759,14 @@ def compute_weights(data):
             'bones_with_weights': len(weights),
             'bones_requested': B,
             'island_clamped_entries': clamped_count,
+            'reach_contained_entries': contain_trimmed,
             'islands': island_debug,
             'bone_weight_stats': bone_weight_stats,
             'debug_vert_positions': debug_vert_positions,
             'timing': {
                 'bone_heat_s': heat_elapsed,
                 'smooth_s': smooth_elapsed,
+                'contain_s': contain_elapsed,
                 'clamp_s': clamp_elapsed,
                 'extract_s': extract_elapsed,
                 'total_s': round(elapsed, 2),
